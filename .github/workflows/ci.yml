@@ -33,6 +33,22 @@ jobs:
           tests/venv/bin/pip install -r tests/requirements.txt pyright 'ruff==0.14.4'
           (cd docs && bun install --frozen-lockfile)
           echo "$PWD/tests/venv/bin" >> "$GITHUB_PATH"
+      - name: Install jj
+        run: |
+          version=v0.46.0-adopt.20260908.1
+          case "$(uname -m)-$(uname -s)" in
+            x86_64-Linux) asset="x86_64-unknown-linux-musl" ;;
+            aarch64-Linux) asset="aarch64-unknown-linux-musl" ;;
+            arm64-Darwin) asset="aarch64-apple-darwin" ;;
+            x86_64-Darwin) asset="x86_64-apple-darwin" ;;
+            *) echo "unsupported platform" && exit 1 ;;
+          esac
+          mkdir /tmp/jj-install
+          curl --proto '=https' --tlsv1.2 --retry 5 --location --silent --show-error --fail \
+            "https://github.com/aria-amini/jj/releases/download/${version}/jj-${version}-${asset}.tar.gz" \
+            | tar -xz -C /tmp/jj-install
+          install -m 0755 /tmp/jj-install/jj /usr/local/bin/jj
+          jj --version
       - name: Run full checks
         run: just check-ci
 

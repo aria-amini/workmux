@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
 
-use crate::git;
 use crate::multiplexer::util::prefixed;
 use crate::multiplexer::{MuxHandle, WindowTarget};
 use crate::prompt::Prompt;
@@ -46,13 +45,14 @@ pub fn open(
 
     // This command requires the worktree to already exist
     // Smart resolution: try handle first, then branch name
-    let (worktree_path, branch_name) = git::find_worktree_in(name, Some(&context.execution_dir))
-        .map_err(|_| {
-            anyhow!(
-                "Worktree '{}' not found. Use 'workmux list' to see available worktrees.",
-                name
-            )
-        })?;
+    let (worktree_path, branch_name) =
+        super::meta::find_workspace_in(context.vcs.as_ref(), name, Some(&context.execution_dir))
+            .map_err(|_| {
+                anyhow!(
+                    "Worktree '{}' not found. Use 'workmux list' to see available worktrees.",
+                    name
+                )
+            })?;
 
     // Derive base handle from the worktree path (in case user provided branch name)
     let base_handle = worktree_path
@@ -61,10 +61,11 @@ pub fn open(
         .to_string_lossy()
         .to_string();
 
-    let attachment = git::get_worktree_attachment_in(&base_handle, Some(&context.execution_dir));
+    let vcs = context.vcs.as_ref();
+    let attachment = super::meta::get_attachment(vcs, &base_handle, Some(&context.execution_dir));
     // Resolve mode using canonical base_handle (not the CLI-provided name which may be a branch).
     // Precedence: CLI override > stored git metadata > config default (from options.mode)
-    let stored_mode = git::get_worktree_mode_opt_in(&base_handle, Some(&context.execution_dir));
+    let stored_mode = super::meta::get_mode_opt(vcs, &base_handle, Some(&context.execution_dir));
     let mode = mode_override.or(stored_mode).unwrap_or(options.mode);
     if mode == MuxMode::Session && options.window_session_name.is_some() {
         anyhow::bail!("--parent-session requires window mode");
@@ -107,10 +108,10 @@ pub fn open(
         if explicit_target.exists()? {
             let stored_target_name = match mode {
                 MuxMode::Window => {
-                    git::get_worktree_target_window_in(&base_handle, Some(&context.execution_dir))
+                    super::meta::get_target_window(vcs, &base_handle, Some(&context.execution_dir))
                 }
                 MuxMode::Session => {
-                    git::get_worktree_target_session_in(&base_handle, Some(&context.execution_dir))
+                    super::meta::get_target_session(vcs, &base_handle, Some(&context.execution_dir))
                 }
             };
             if stored_target_name.as_deref() != Some(explicit_target_name) {
@@ -131,18 +132,22 @@ pub fn open(
                     .mux
                     .supports_window_ownership()
                     .then(|| {
-                        git::get_worktree_window_token_in(
+                        super::meta::get_window_token(
+                            vcs,
                             &base_handle,
                             Some(&context.execution_dir),
                         )
                     })
                     .flatten();
                 let prior_window_name =
-                    git::get_worktree_target_window_in(&base_handle, Some(&context.execution_dir))
+                    super::meta::get_target_window(vcs, &base_handle, Some(&context.execution_dir))
                         .unwrap_or_else(|| base_handle.clone());
                 let full_base = prefixed(&context.prefix, &prior_window_name);
-                let prior_parent_session =
-                    git::get_worktree_window_session_in(&base_handle, Some(&context.execution_dir));
+                let prior_parent_session = super::meta::get_window_session(
+                    vcs,
+                    &base_handle,
+                    Some(&context.execution_dir),
+                );
                 let owned_targets = window_token
                     .as_deref()
                     .map(|token| {
@@ -187,9 +192,12 @@ pub fn open(
                 }
             }
             MuxMode::Session => {
-                let prior_session_name =
-                    git::get_worktree_target_session_in(&base_handle, Some(&context.execution_dir))
-                        .unwrap_or_else(|| base_handle.clone());
+                let prior_session_name = super::meta::get_target_session(
+                    vcs,
+                    &base_handle,
+                    Some(&context.execution_dir),
+                )
+                .unwrap_or_else(|| base_handle.clone());
                 let full_name = prefixed(&context.prefix, &prior_session_name);
                 if MuxHandle::exists_full(context.mux.as_ref(), prior_mode, &full_name)? {
                     info!(
@@ -203,15 +211,14 @@ pub fn open(
         }
     }
 
-    let target_window_name = options
-        .target_window_name
-        .clone()
-        .or_else(|| git::get_worktree_target_window_in(&base_handle, Some(&context.execution_dir)));
+    let target_window_name = options.target_window_name.clone().or_else(|| {
+        super::meta::get_target_window(vcs, &base_handle, Some(&context.execution_dir))
+    });
     let target_session_name = options.target_session_name.clone().or_else(|| {
-        git::get_worktree_target_session_in(&base_handle, Some(&context.execution_dir))
+        super::meta::get_target_session(vcs, &base_handle, Some(&context.execution_dir))
     });
     let window_session_name = options.window_session_name.clone().or_else(|| {
-        git::get_worktree_window_session_in(&base_handle, Some(&context.execution_dir))
+        super::meta::get_window_session(vcs, &base_handle, Some(&context.execution_dir))
     });
 
     // Update options with the resolved mode
@@ -242,7 +249,7 @@ pub fn open(
     let target = MuxHandle::new(context.mux.as_ref(), mode, &context.prefix, target_name);
     let fallback_window_target = WindowTarget::new(target.full_name(), window_session_name.clone());
     let window_token = if mode == MuxMode::Window && context.mux.supports_window_ownership() {
-        git::get_worktree_window_token_in(&base_handle, Some(&context.execution_dir))
+        super::meta::get_window_token(vcs, &base_handle, Some(&context.execution_dir))
     } else {
         None
     };
@@ -285,14 +292,16 @@ pub fn open(
             } else {
                 "window"
             };
-            let _ = git::set_worktree_meta_in(
+            let _ = super::meta::set_meta(
+                vcs,
                 &base_handle,
                 "mode",
                 mode_str,
                 Some(&context.execution_dir),
             );
             if let Some(target_window_name) = &options.target_window_name {
-                let _ = git::set_worktree_meta_in(
+                let _ = super::meta::set_meta(
+                    vcs,
                     &base_handle,
                     "target-window",
                     target_window_name,
@@ -300,7 +309,8 @@ pub fn open(
                 );
             }
             if let Some(target_session_name) = &options.target_session_name {
-                let _ = git::set_worktree_meta_in(
+                let _ = super::meta::set_meta(
+                    vcs,
                     &base_handle,
                     "target-session",
                     target_session_name,
@@ -308,7 +318,8 @@ pub fn open(
                 );
             }
             if let Some(window_session_name) = &options.window_session_name {
-                let _ = git::set_worktree_meta_in(
+                let _ = super::meta::set_meta(
+                    vcs,
                     &base_handle,
                     "window-session",
                     window_session_name,
@@ -360,8 +371,14 @@ pub fn open(
         } else {
             "window"
         };
-        git::set_worktree_meta_in(&base_handle, "mode", mode_str, Some(&context.execution_dir))
-            .context("Failed to persist worktree mode")?;
+        super::meta::set_meta(
+            vcs,
+            &base_handle,
+            "mode",
+            mode_str,
+            Some(&context.execution_dir),
+        )
+        .context("Failed to persist worktree mode")?;
         info!(
             handle = base_handle,
             mode = mode_str,
@@ -369,7 +386,8 @@ pub fn open(
         );
     }
     if let Some(target_window_name) = &cli_target_window_name {
-        git::set_worktree_meta_in(
+        super::meta::set_meta(
+            vcs,
             &base_handle,
             "target-window",
             target_window_name,
@@ -379,7 +397,8 @@ pub fn open(
     }
     if mode == MuxMode::Session {
         if let Some(target_session_name) = &cli_target_session_name {
-            git::set_worktree_meta_in(
+            super::meta::set_meta(
+                vcs,
                 &base_handle,
                 "target-session",
                 target_session_name,
@@ -388,7 +407,8 @@ pub fn open(
             .context("Failed to persist target session")?;
         }
     } else if let Some(window_session_name) = &cli_window_session_name {
-        git::set_worktree_meta_in(
+        super::meta::set_meta(
+            vcs,
             &base_handle,
             "window-session",
             window_session_name,
@@ -398,7 +418,8 @@ pub fn open(
     }
 
     if mode == MuxMode::Window && context.mux.supports_window_ownership() {
-        options.window_token = Some(git::ensure_worktree_window_token_in(
+        options.window_token = Some(super::meta::ensure_window_token(
+            vcs,
             &base_handle,
             Some(&context.execution_dir),
         )?);
@@ -455,9 +476,10 @@ pub fn open(
         agent,
         None,
     )?;
-    git::set_worktree_attachment_in(
+    super::meta::set_attachment(
+        vcs,
         &base_handle,
-        git::WorktreeAttachment::Multiplexer,
+        crate::git::WorktreeAttachment::Multiplexer,
         Some(&context.execution_dir),
     )?;
     info!(

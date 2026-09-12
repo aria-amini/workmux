@@ -34,17 +34,24 @@ fn default_add_worktree_base(repo_path: &Path) -> String {
     crate::config::Config::load_with_location_from(repo_path, None)
         .ok()
         .and_then(|(config, _)| {
-            workflow::resolve_configured_base_branch(&config, repo_path)
+            let vcs = crate::vcs::detect::detect_backend_in(repo_path).ok()?;
+            workflow::resolve_configured_base_branch(&config, repo_path, vcs.as_ref())
                 .ok()
                 .flatten()
         })
         .or_else(|| {
-            git::get_current_branch_in(repo_path)
+            let vcs = crate::vcs::detect::detect_backend_in(repo_path).ok()?;
+            vcs.get_current_branch_in(repo_path)
                 .ok()
+                .flatten()
                 .map(|branch| branch.trim().to_string())
                 .filter(|branch| !branch.is_empty())
         })
-        .or_else(|| git::get_default_branch_in(Some(repo_path)).ok())
+        .or_else(|| {
+            crate::vcs::detect::detect_backend_in(repo_path)
+                .ok()
+                .and_then(|vcs| vcs.get_default_branch_in(Some(repo_path)).ok())
+        })
         .unwrap_or_else(|| "main".to_string())
 }
 
@@ -384,7 +391,11 @@ impl App {
             return;
         }
 
-        let is_dirty = git::has_uncommitted_changes(&worktree.path).unwrap_or(true);
+        let is_dirty = crate::vcs::detect::detect_backend_in(&worktree.path)
+            .ok()
+            .and_then(|vcs| vcs.get_status(&worktree.path, None).ok())
+            .map(|status| status.is_dirty)
+            .unwrap_or(true);
 
         self.pending_remove = Some(RemovePlan {
             handle: worktree.handle.clone(),
@@ -484,15 +495,26 @@ impl App {
         }
 
         let prefix = self.config.window_prefix();
+        let vcs = crate::vcs::detect::detect_backend_in(std::path::Path::new(".")).ok();
         if worktree.mode == crate::config::MuxMode::Window {
-            let target_name = crate::git::get_worktree_target_window(&worktree.handle)
+            let target_name = vcs
+                .as_ref()
+                .and_then(|vcs| {
+                    workflow::meta::get_target_window(vcs.as_ref(), &worktree.handle, None)
+                })
                 .unwrap_or_else(|| worktree.handle.clone());
             let full_name = crate::multiplexer::util::prefixed(prefix, &target_name);
-            let parent_session = crate::git::get_worktree_window_session(&worktree.handle);
+            let parent_session = vcs.as_ref().and_then(|vcs| {
+                workflow::meta::get_window_session(vcs.as_ref(), &worktree.handle, None)
+            });
             let window_token = self
                 .mux
                 .supports_window_ownership()
-                .then(|| crate::git::get_worktree_window_token(&worktree.handle))
+                .then(|| {
+                    vcs.as_ref().and_then(|vcs| {
+                        workflow::meta::get_window_token(vcs.as_ref(), &worktree.handle, None)
+                    })
+                })
                 .flatten();
             let target = if let Some(token) = window_token {
                 self.mux
@@ -519,7 +541,11 @@ impl App {
                 let _ = self.mux.kill_window_target(&target);
             }
         } else {
-            let target_name = crate::git::get_worktree_target_session(&worktree.handle)
+            let target_name = vcs
+                .as_ref()
+                .and_then(|vcs| {
+                    workflow::meta::get_target_session(vcs.as_ref(), &worktree.handle, None)
+                })
                 .unwrap_or_else(|| worktree.handle.clone());
             let full_name = crate::multiplexer::util::prefixed(prefix, &target_name);
             let _ = crate::multiplexer::handle::MuxHandle::kill_full(
@@ -540,7 +566,18 @@ impl App {
             self.spawn_worktree_fetch();
         }
 
-        let gone = git::get_gone_branches().unwrap_or_default();
+        let gone = crate::vcs::detect::detect_backend_in(std::path::Path::new("."))
+            .ok()
+            .and_then(|vcs| {
+                vcs.get_gone_branches_in(&crate::util::canon_or_self(std::path::Path::new(".")))
+                    .ok()
+                    .map(|branches| {
+                        branches
+                            .into_iter()
+                            .collect::<std::collections::HashSet<_>>()
+                    })
+            })
+            .unwrap_or_default();
 
         let mut candidates: Vec<SweepCandidate> = Vec::new();
 
@@ -810,7 +847,9 @@ impl App {
                     Ok(b) if !b.is_empty() && b != "(detached)" => b,
                     _ => return,
                 };
-                let base = git::get_branch_base_in(&branch, Some(&path)).ok();
+                let base = crate::vcs::detect::detect_backend_in(&path)
+                    .ok()
+                    .and_then(|vcs| vcs.meta().get_branch_base(branch.as_str(), Some(&path)));
                 (path, branch, base)
             }
         };
@@ -888,9 +927,10 @@ impl App {
         };
         let new_base = &picker.branches[idx];
 
-        if let Err(e) =
-            git::set_branch_base_in(&picker.worktree_branch, new_base, Some(&picker.repo_path))
-        {
+        if let Err(e) = crate::vcs::detect::detect_backend_in(&picker.repo_path).and_then(|vcs| {
+            vcs.meta()
+                .set_branch_base(&picker.worktree_branch, new_base, Some(&picker.repo_path))
+        }) {
             self.status_message = Some((
                 format!("Failed to set base: {}", e),
                 std::time::Instant::now(),

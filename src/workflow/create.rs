@@ -3,10 +3,12 @@ use std::path::Path;
 
 use crate::config::MuxMode;
 use crate::multiplexer::MuxHandle;
+use crate::vcs::CreateWorkspaceOptions;
 use crate::{git, spinner};
 use tracing::{debug, info, warn};
 
-/// Check if a path is registered as a git worktree.
+/// Check if a path is registered as a worktree/workspace, over any
+/// [`crate::vcs::VcsBackend`] rather than raw `git worktree list`.
 /// Uses canonicalize() to handle symlinks, case sensitivity, and relative paths.
 fn is_registered_worktree(path: &Path, context: &WorkflowContext) -> Result<bool> {
     // Canonicalize the input path for reliable comparison
@@ -15,19 +17,35 @@ fn is_registered_worktree(path: &Path, context: &WorkflowContext) -> Result<bool
         Err(_) => return Ok(false), // Can't canonicalize = not a valid worktree
     };
 
-    let worktrees = git::list_worktrees_in(Some(&context.execution_dir))?;
-    for (wt_path, _) in worktrees {
-        // Canonicalize git's reported path as well
-        if let Ok(abs_wt) = std::fs::canonicalize(&wt_path) {
+    let worktrees = context
+        .vcs
+        .list_workspaces_in(Some(&context.execution_dir))?;
+    for entry in worktrees {
+        // Canonicalize the reported path as well
+        if let Ok(abs_wt) = std::fs::canonicalize(&entry.path) {
             if abs_wt == abs_path {
                 return Ok(true);
             }
-        } else if wt_path == path {
+        } else if entry.path == path {
             // Fallback to string comparison if canonicalization fails
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Check if any existing worktree/workspace already has `branch_name`
+/// checked out, over any [`crate::vcs::VcsBackend`]. This is the
+/// backend-generic replacement for `git::worktree_exists_in`, which shells
+/// out to `git worktree list --porcelain` and therefore errors outright in a
+/// jj-only repository (no `.git` at all, even colocated jj never registers a
+/// secondary workspace as a git worktree).
+fn workspace_exists_for_branch(context: &WorkflowContext, branch_name: &str) -> Result<bool> {
+    Ok(context
+        .vcs
+        .list_workspaces_in(Some(&context.execution_dir))?
+        .iter()
+        .any(|entry| entry.branch_or_bookmark.as_deref() == Some(branch_name)))
 }
 
 use super::cleanup;
@@ -91,7 +109,7 @@ fn create_impl(
         "create:start"
     );
 
-    let worktree_exists = git::worktree_exists_in(branch_name, Some(&context.execution_dir))?;
+    let worktree_exists = workspace_exists_for_branch(context, branch_name)?;
     let mut current_handle = handle.to_string();
     let mut placement_window_id = None;
 
@@ -235,7 +253,9 @@ fn create_impl(
     }
 
     // Auto-detect: create branch if it doesn't exist
-    let branch_exists = git::branch_exists_in(branch_name, Some(&context.execution_dir))?;
+    let branch_exists = context
+        .vcs
+        .branch_exists_in(branch_name, Some(&context.execution_dir))?;
     if branch_exists && remote_branch.is_some() && checkout_ref.is_none() {
         return Err(anyhow!(
             "Branch '{}' already exists. Remove '--remote' or pick a different branch name.",
@@ -315,19 +335,46 @@ fn create_impl(
             // Use the explicitly provided base branch/commit/tag
             Some(base.to_string())
         } else {
-            // Default to the current branch when no explicit base was provided
-            let current_branch = git::get_current_branch_in(&context.execution_dir)
-                .context("Failed to determine the current branch to use as the base")?;
-            let current_branch = current_branch.trim().to_string();
+            // Default to the current branch when no explicit base was
+            // provided. This goes through the VCS backend rather than
+            // `git::get_current_branch_in`: `git branch --show-current` fails
+            // outright inside a jj-only repository, and in a colocated one jj
+            // keeps git's HEAD detached, so it exits 0 with empty output.
+            //
+            // `VcsBackend::get_current_branch_in` returns `Option<String>`,
+            // and the meaning of `None` differs per backend:
+            //
+            // - git: HEAD really is detached. That has always been a hard
+            //   error here, and still is — silently substituting the default
+            //   branch would change long-standing git behavior.
+            // - jj: `@` simply carries no bookmark, which is the *ordinary*
+            //   state of a jj working-copy commit rather than an anomaly.
+            //   There is no "current branch" concept to report, so fall back
+            //   to the repository's default bookmark (jj's `trunk()`, then
+            //   `main`/`master`) — the same answer `workmux` would use for a
+            //   repo whose base is unconfigured.
+            let current_branch = context
+                .vcs
+                .get_current_branch_in(&context.execution_dir)
+                .context("Failed to determine the current branch to use as the base")?
+                .map(|branch| branch.trim().to_string())
+                .filter(|branch| !branch.is_empty());
 
-            if current_branch.is_empty() {
-                return Err(anyhow!(
-                    "Cannot determine current branch (detached HEAD). \
-                     Use --base to explicitly specify the starting point."
-                ));
+            match current_branch {
+                Some(branch) => Some(branch),
+                None if context.vcs.name() == "git" => {
+                    return Err(anyhow!(
+                        "Cannot determine current branch (detached HEAD). \
+                         Use --base to explicitly specify the starting point."
+                    ));
+                }
+                None => Some(
+                    context
+                        .vcs
+                        .get_default_branch_in(Some(&context.execution_dir))
+                        .context("Failed to determine the current branch to use as the base")?,
+                ),
             }
-
-            Some(current_branch)
         }
     } else {
         None
@@ -404,23 +451,30 @@ fn create_impl(
         "create:creating worktree"
     );
 
-    // Acquire an exclusive lock to serialize .git/config writes across parallel
-    // workmux processes. Without this, concurrent `workmux add` commands race on
-    // git's config.lock file and fail with "could not lock config file".
-    let _config_lock = git::GitConfigLock::acquire(&context.git_common_dir)
+    // Acquire an exclusive lock to serialize the whole creation sequence
+    // (workspace creation plus the metadata writes below) across parallel
+    // workmux processes. For git, without this, concurrent `workmux add`
+    // commands race on git's config.lock file and fail with "could not lock
+    // config file". Backends that don't share such a file (jj, whose metadata
+    // store locks internally per write) return a no-op guard.
+    let _config_lock = context
+        .vcs
+        .lock_creation_sequence(&context.git_common_dir)
         .context("Failed to acquire git config lock")?;
 
     // Store the base branch before checkout so observers that see the worktree
     // appear on disk also see complete branch metadata.
     if let Some(ref base) = base_branch_for_creation {
-        git::set_branch_base_in(branch_name, base, Some(&context.execution_dir)).with_context(
-            || {
+        context
+            .vcs
+            .meta()
+            .set_branch_base(branch_name, base, Some(&context.execution_dir))
+            .with_context(|| {
                 format!(
                     "Failed to store base branch '{}' for branch '{}'",
                     base, branch_name
                 )
-            },
-        )?;
+            })?;
         debug!(
             branch = branch_name,
             base = base,
@@ -428,22 +482,32 @@ fn create_impl(
         );
     }
 
-    git::create_worktree_in(
-        &worktree_path,
-        branch_name,
-        create_new,
-        base_branch_for_creation.as_deref(),
-        track_upstream,
-        Some(&context.execution_dir),
-    )
-    .context("Failed to create git worktree")?;
+    context
+        .vcs
+        .create_workspace_in(
+            &CreateWorkspaceOptions {
+                path: worktree_path.clone(),
+                name_or_branch: branch_name.to_string(),
+                create_branch: create_new,
+                base: base_branch_for_creation.clone(),
+                track_upstream,
+            },
+            Some(&context.execution_dir),
+        )
+        .context("Failed to create git worktree")?;
 
     if headless {
-        if let Err(error) = git::set_worktree_attachment_in(
-            &current_handle,
-            git::WorktreeAttachment::Headless,
-            Some(&context.execution_dir),
-        ) {
+        if let Err(error) = git::WorktreeAttachment::Headless
+            .as_meta_value()
+            .and_then(|value| {
+                context.vcs.meta().set(
+                    &current_handle,
+                    "attachment",
+                    value,
+                    Some(&context.execution_dir),
+                )
+            })
+        {
             drop(_config_lock);
             let rollback = cleanup::cleanup_headless(
                 context,
@@ -470,25 +534,29 @@ fn create_impl(
             MuxMode::Session => "session",
             MuxMode::Window => "window",
         };
-        git::set_worktree_meta_in(
-            &current_handle,
-            "mode",
-            mode_str,
-            Some(&context.execution_dir),
-        )
-        .with_context(|| {
-            format!(
-                "Failed to store tmux mode for worktree '{}'",
-                current_handle
+        context
+            .vcs
+            .meta()
+            .set(
+                &current_handle,
+                "mode",
+                mode_str,
+                Some(&context.execution_dir),
             )
-        })?;
-        git::set_worktree_attachment_in(
+            .with_context(|| {
+                format!(
+                    "Failed to store tmux mode for worktree '{}'",
+                    current_handle
+                )
+            })?;
+        context.vcs.meta().set(
             &current_handle,
-            git::WorktreeAttachment::Multiplexer,
+            "attachment",
+            git::WorktreeAttachment::Multiplexer.as_meta_value()?,
             Some(&context.execution_dir),
         )?;
         if let Some(target_window_name) = &options.target_window_name {
-            git::set_worktree_meta_in(
+            context.vcs.meta().set(
                 &current_handle,
                 "target-window",
                 target_window_name,
@@ -496,7 +564,7 @@ fn create_impl(
             )?;
         }
         if let Some(target_session_name) = &options.target_session_name {
-            git::set_worktree_meta_in(
+            context.vcs.meta().set(
                 &current_handle,
                 "target-session",
                 target_session_name,
@@ -504,7 +572,7 @@ fn create_impl(
             )?;
         }
         if let Some(window_session_name) = &options.window_session_name {
-            git::set_worktree_meta_in(
+            context.vcs.meta().set(
                 &current_handle,
                 "window-session",
                 window_session_name,
@@ -512,7 +580,8 @@ fn create_impl(
             )?;
         }
         if options.mode == MuxMode::Window && context.mux.supports_window_ownership() {
-            options.window_token = Some(git::ensure_worktree_window_token_in(
+            options.window_token = Some(super::meta::ensure_window_token(
+                context.vcs.as_ref(),
                 &current_handle,
                 Some(&context.execution_dir),
             )?);
@@ -1202,5 +1271,551 @@ mod tests {
             Some("window")
         );
         assert!(!git::branch_exists_in("feature", Some(&repo_a)).unwrap());
+    }
+
+    /// Characterization test for the attached `create()` path after routing
+    /// creation through `context.vcs` instead of calling `git::*` directly.
+    ///
+    /// Every assertion below describes the git-level state the pre-migration
+    /// code produced: a registered worktree at the handle path, a new branch,
+    /// a `workmux.branch.<branch>.base` entry, and the full per-worktree
+    /// metadata block (mode / attachment / target-window / target-session /
+    /// window-session) in `.git/config`.
+    #[test]
+    fn attached_create_writes_identical_git_state_through_the_vcs_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&repo);
+
+        let ctx =
+            WorkflowContext::new_in(&repo, Config::default(), Arc::new(TestMux), None).unwrap();
+        assert_eq!(ctx.vcs.name(), "git");
+
+        let mut options = SetupOptions::new(false, false, false);
+        options.focus_window = false;
+        options.mode = MuxMode::Window;
+        options.target_window_name = Some("my-window".to_string());
+        options.target_session_name = Some("my-session".to_string());
+        options.window_session_name = Some("parent-session".to_string());
+
+        let result = create(
+            &ctx,
+            CreateArgs {
+                branch_name: "feature",
+                handle: "feature",
+                base_branch: Some("main"),
+                remote_branch: None,
+                checkout_ref: None,
+                prompt: None,
+                options,
+                mode_override: None,
+                agent: None,
+                is_explicit_name: false,
+                prompt_file_only: false,
+                fork_source: None,
+            },
+        )
+        .unwrap();
+
+        // Worktree exists on disk and is registered with git.
+        assert!(result.worktree_path.exists());
+        assert!(is_registered_worktree(&result.worktree_path, &ctx).unwrap());
+        assert_eq!(
+            git::get_worktree_path_in("feature", Some(&repo))
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            result.worktree_path.canonicalize().unwrap()
+        );
+
+        // Branch was created and its base recorded.
+        assert!(git::branch_exists_in("feature", Some(&repo)).unwrap());
+        assert_eq!(
+            git::get_branch_base_in("feature", Some(&repo)).unwrap(),
+            "main"
+        );
+
+        // Full metadata block, still readable via the unchanged git readers.
+        assert_eq!(
+            git::get_worktree_meta_in("feature", "mode", Some(&repo)).as_deref(),
+            Some("window")
+        );
+        assert_eq!(
+            git::get_worktree_attachment_in("feature", Some(&repo)),
+            git::WorktreeAttachment::Multiplexer
+        );
+        assert_eq!(
+            git::get_worktree_meta_in("feature", "target-window", Some(&repo)).as_deref(),
+            Some("my-window")
+        );
+        assert_eq!(
+            git::get_worktree_meta_in("feature", "target-session", Some(&repo)).as_deref(),
+            Some("my-session")
+        );
+        assert_eq!(
+            git::get_worktree_meta_in("feature", "window-session", Some(&repo)).as_deref(),
+            Some("parent-session")
+        );
+        // TestMux does not claim window ownership, so no token is minted -
+        // unchanged from before the migration.
+        assert_eq!(
+            git::get_worktree_meta_in("feature", "window-token", Some(&repo)),
+            None
+        );
+    }
+
+    /// Same characterization, for the headless (`workmux add --headless`)
+    /// path, which shares `create_impl` with the attached path.
+    #[test]
+    fn headless_create_writes_identical_git_state_through_the_vcs_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&repo);
+
+        let ctx =
+            WorkflowContext::new_in(&repo, Config::default(), Arc::new(TestMux), None).unwrap();
+
+        let mut options = SetupOptions::new(false, false, false);
+        options.focus_window = false;
+
+        let result = create_headless(
+            &ctx,
+            CreateArgs {
+                branch_name: "headless-feature",
+                handle: "headless-feature",
+                base_branch: Some("main"),
+                remote_branch: None,
+                checkout_ref: None,
+                prompt: None,
+                options,
+                mode_override: None,
+                agent: None,
+                is_explicit_name: false,
+                prompt_file_only: false,
+                fork_source: None,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(result.worktree_path.exists());
+        assert!(is_registered_worktree(&result.worktree_path, &ctx).unwrap());
+        assert!(git::branch_exists_in("headless-feature", Some(&repo)).unwrap());
+        assert_eq!(
+            git::get_branch_base_in("headless-feature", Some(&repo)).unwrap(),
+            "main"
+        );
+        assert_eq!(
+            git::get_worktree_attachment_in("headless-feature", Some(&repo)),
+            git::WorktreeAttachment::Headless
+        );
+        // The headless path writes no multiplexer metadata.
+        assert_eq!(
+            git::get_worktree_meta_in("headless-feature", "mode", Some(&repo)),
+            None
+        );
+        assert_eq!(
+            git::get_worktree_meta_in("headless-feature", "target-window", Some(&repo)),
+            None
+        );
+    }
+
+    /// Seed a freshly-initialized jj fixture with an initial commit and a
+    /// `main` bookmark, then move `@` off it, mirroring `jj_backend.rs`'s
+    /// private `seed` test helper (duplicated here rather than shared, since
+    /// that helper is private to `vcs::jj_backend`'s own test module).
+    fn seed_jj_fixture(repo: &Path) {
+        std::fs::write(repo.join("README.md"), "base\n").unwrap();
+        test_support::run_jj(repo, &["describe", "-m", "initial"]);
+        test_support::run_jj(repo, &["bookmark", "create", "main", "-r", "@"]);
+        test_support::run_jj(repo, &["new"]);
+    }
+
+    /// End-to-end coverage for the full path through the jj wiring from
+    /// Tasks 5-8: a real `WorkflowContext::new_in` against a real jj
+    /// fixture, `create_headless` (`workmux add --headless`), asserting the
+    /// resulting on-disk and jj-repo state entirely through the same
+    /// `VcsBackend`/`WorkmuxMetaStore` methods production code uses (never a
+    /// raw `jj` shell-out from the assertions themselves).
+    ///
+    /// Run for both a jj-only fixture (`jj git init --no-colocate`, no
+    /// `.git` at the workspace root) and a colocated one (`jj git init
+    /// --colocate`), since `create_impl`'s worktree-collision detection
+    /// (`is_registered_worktree`/`workspace_exists_for_branch`) and
+    /// `JjBackend::create_workspace_in`'s parent-directory handling both
+    /// depend on repo layout that differs between the two.
+    fn jj_headless_create_writes_workspace_bookmark_and_metadata(init_fixture: fn(&Path)) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_fixture(&repo);
+        seed_jj_fixture(&repo);
+
+        let ctx =
+            WorkflowContext::new_in(&repo, Config::default(), Arc::new(TestMux), None).unwrap();
+        assert_eq!(ctx.vcs.name(), "jj");
+
+        let mut options = SetupOptions::new(false, false, false);
+        options.focus_window = false;
+
+        let result = create_headless(
+            &ctx,
+            CreateArgs {
+                branch_name: "jj-feature",
+                handle: "jj-feature",
+                base_branch: Some("main"),
+                remote_branch: None,
+                checkout_ref: None,
+                prompt: None,
+                options,
+                mode_override: None,
+                agent: None,
+                is_explicit_name: false,
+                prompt_file_only: false,
+                fork_source: None,
+            },
+            false,
+        )
+        .unwrap();
+
+        // Workspace directory exists on disk with the base's content checked out.
+        assert!(result.worktree_path.exists());
+        assert!(result.worktree_path.join("README.md").exists());
+
+        // Workspace is registered with jj at the expected path, with a
+        // bookmark checked out matching the plan's
+        // "bookmark-per-workspace-by-default" ruling.
+        let workspaces = ctx.vcs.list_workspaces_in(Some(&repo)).unwrap();
+        let expected_path = result.worktree_path.canonicalize().unwrap();
+        let entry = workspaces
+            .iter()
+            .find(|entry| entry.path.canonicalize().unwrap() == expected_path)
+            .expect("newly created jj workspace should be listed");
+        assert_eq!(entry.branch_or_bookmark.as_deref(), Some("jj-feature"));
+        assert!(ctx.vcs.branch_exists_in("jj-feature", Some(&repo)).unwrap());
+
+        // Metadata landed in JjMetaStore's TOML file, read back through the
+        // same WorkmuxMetaStore methods the rest of workmux uses (not a
+        // direct TOML-file read from the test).
+        assert_eq!(
+            ctx.vcs.meta().get_branch_base("jj-feature", Some(&repo)),
+            Some("main".to_string())
+        );
+        assert_eq!(
+            ctx.vcs.meta().get("jj-feature", "attachment", Some(&repo)),
+            Some("headless".to_string())
+        );
+        // The headless path writes no multiplexer metadata, same as the git case.
+        assert_eq!(ctx.vcs.meta().get("jj-feature", "mode", Some(&repo)), None);
+    }
+
+    /// The *default* base path: no `--base`, no `base_branch:` in
+    /// `.workmux.yaml`. Every other jj test in this module supplies
+    /// `base_branch: Some("main")`, so this is the path that `git branch
+    /// --show-current` used to break — it fails outright in a jj-only repo and
+    /// reports an empty (detached) branch in a colocated one, because jj keeps
+    /// git's HEAD detached. With no bookmark on `@`, the jj backend has no
+    /// "current branch" to report at all, so the base must fall back to the
+    /// repository's default bookmark.
+    fn jj_create_with_no_configured_base_uses_default_bookmark(init_fixture: fn(&Path)) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_fixture(&repo);
+        // `seed_jj_fixture` leaves `@` as a fresh bookmark-less child of
+        // `main`. jj's ordinary state; the ancestor recovery in
+        // `get_current_branch_in` reports the workspace's branch as `main`.
+        seed_jj_fixture(&repo);
+
+        let ctx =
+            WorkflowContext::new_in(&repo, Config::default(), Arc::new(TestMux), None).unwrap();
+        assert_eq!(ctx.vcs.name(), "jj");
+        assert_eq!(
+            ctx.vcs.get_current_branch_in(&repo).unwrap(),
+            Some("main".to_string())
+        );
+
+        let mut options = SetupOptions::new(false, false, false);
+        options.focus_window = false;
+
+        let result = create_headless(
+            &ctx,
+            CreateArgs {
+                branch_name: "jj-default-base",
+                handle: "jj-default-base",
+                base_branch: None,
+                remote_branch: None,
+                checkout_ref: None,
+                prompt: None,
+                options,
+                mode_override: None,
+                agent: None,
+                is_explicit_name: false,
+                prompt_file_only: false,
+                fork_source: None,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(result.worktree_path.exists());
+        // The base fell back to the default bookmark, and was recorded as such.
+        assert_eq!(
+            ctx.vcs
+                .meta()
+                .get_branch_base("jj-default-base", Some(&repo)),
+            Some("main".to_string())
+        );
+        // ...and the new workspace really is parented on `main`, with the
+        // base's content checked out.
+        assert!(result.worktree_path.join("README.md").exists());
+        let parent_bookmarks = test_support::run_jj(
+            &result.worktree_path,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "@-",
+                "-T",
+                r#"local_bookmarks.map(|b| b.name()).join(",")"#,
+            ],
+        );
+        assert_eq!(parent_bookmarks.trim(), "main");
+        assert!(
+            ctx.vcs
+                .branch_exists_in("jj-default-base", Some(&repo))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn jj_create_with_no_configured_base_uses_default_bookmark_jj_only() {
+        jj_create_with_no_configured_base_uses_default_bookmark(test_support::init_jj_repo);
+    }
+
+    #[test]
+    fn jj_create_with_no_configured_base_uses_default_bookmark_colocated() {
+        jj_create_with_no_configured_base_uses_default_bookmark(test_support::init_colocated_repo);
+    }
+
+    /// Characterization: for a git repo the default base path is unchanged -
+    /// the current branch is used verbatim, with no default-branch fallback.
+    #[test]
+    fn git_create_with_no_configured_base_uses_the_current_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&repo);
+        // A non-default current branch, so "current branch" and "default
+        // branch" are distinguishable.
+        test_support::run_git(&repo, &["checkout", "-b", "side"]);
+
+        let ctx =
+            WorkflowContext::new_in(&repo, Config::default(), Arc::new(TestMux), None).unwrap();
+        let mut options = SetupOptions::new(false, false, false);
+        options.focus_window = false;
+
+        create_headless(
+            &ctx,
+            CreateArgs {
+                branch_name: "git-default-base",
+                handle: "git-default-base",
+                base_branch: None,
+                remote_branch: None,
+                checkout_ref: None,
+                prompt: None,
+                options,
+                mode_override: None,
+                agent: None,
+                is_explicit_name: false,
+                prompt_file_only: false,
+                fork_source: None,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            git::get_branch_base_in("git-default-base", Some(&repo)).unwrap(),
+            "side"
+        );
+    }
+
+    /// Characterization: a git repo with a genuinely detached HEAD still
+    /// errors rather than silently falling back to the default branch. Only
+    /// jj's bookmark-less `@` - a backend with no current-branch concept -
+    /// gets the fallback treatment.
+    #[test]
+    fn git_create_with_detached_head_and_no_base_still_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&repo);
+        test_support::run_git(&repo, &["checkout", "--detach", "HEAD"]);
+
+        let ctx =
+            WorkflowContext::new_in(&repo, Config::default(), Arc::new(TestMux), None).unwrap();
+        let mut options = SetupOptions::new(false, false, false);
+        options.focus_window = false;
+
+        let error = create_headless(
+            &ctx,
+            CreateArgs {
+                branch_name: "git-detached",
+                handle: "git-detached",
+                base_branch: None,
+                remote_branch: None,
+                checkout_ref: None,
+                prompt: None,
+                options,
+                mode_override: None,
+                agent: None,
+                is_explicit_name: false,
+                prompt_file_only: false,
+                fork_source: None,
+            },
+            false,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("detached HEAD"), "{message}");
+    }
+
+    #[test]
+    fn jj_headless_create_writes_workspace_bookmark_and_metadata_jj_only() {
+        jj_headless_create_writes_workspace_bookmark_and_metadata(test_support::init_jj_repo);
+    }
+
+    #[test]
+    fn jj_headless_create_writes_workspace_bookmark_and_metadata_colocated() {
+        jj_headless_create_writes_workspace_bookmark_and_metadata(
+            test_support::init_colocated_repo,
+        );
+    }
+
+    /// The remove half of the full create -> remove round trip, exercised
+    /// once against the colocated fixture. The jj-only fixture is not
+    /// re-run through `remove` as well: `workflow::remove`'s jj path (the
+    /// `find_worktree`/`attachment_via_vcs`/`perform_jj_destructive_cleanup`
+    /// wiring added alongside this test) never branches on colocated vs
+    /// jj-only - every jj call it makes resolves through `jj`'s own CLI
+    /// against `.jj/repo`, which is identical in shape for both fixture
+    /// kinds. The create-side test above already covers both kinds for the
+    /// parts of the path that *do* differ (parent-directory creation,
+    /// worktree-collision detection). Running the identical remove
+    /// assertions twice would add test runtime without covering any new
+    /// branch.
+    ///
+    /// `workflow::remove` -> `cleanup::cleanup_impl` calls
+    /// `context.chdir_to_main_worktree()`, which mutates the whole test
+    /// binary's process-wide current directory - unlike every other test in
+    /// this module, which only ever reads paths explicitly. Under `cargo
+    /// test`'s default parallel execution that would race with any other
+    /// test relying on an implicit cwd, so (mirroring
+    /// `workflow_create_uses_explicit_repo_not_process_cwd` above) this test
+    /// re-execs itself as an isolated child process via
+    /// `test_support::run_isolated_test`, confining the chdir to a process
+    /// that runs this one test and exits immediately after.
+    #[test]
+    fn jj_headless_create_then_remove_round_trip_forgets_workspace_and_metadata() {
+        const TEST_NAME: &str = "workflow::create::tests::jj_headless_create_then_remove_round_trip_forgets_workspace_and_metadata";
+        if !test_support::is_isolated_child(TEST_NAME) {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            test_support::init_colocated_repo(&repo);
+            seed_jj_fixture(&repo);
+
+            test_support::run_isolated_test(TEST_NAME, &repo, &[("WM_TEST_TEMP", temp.path())]);
+            return;
+        }
+
+        println!("{}", test_support::ISOLATED_TEST_CANARY);
+        let temp = std::env::var_os("WM_TEST_TEMP").map(PathBuf::from).unwrap();
+        let repo = temp.join("repo");
+
+        let ctx =
+            WorkflowContext::new_in(&repo, Config::default(), Arc::new(TestMux), None).unwrap();
+
+        let mut options = SetupOptions::new(false, false, false);
+        options.focus_window = false;
+
+        let result = create_headless(
+            &ctx,
+            CreateArgs {
+                branch_name: "jj-round-trip",
+                handle: "jj-round-trip",
+                base_branch: Some("main"),
+                remote_branch: None,
+                checkout_ref: None,
+                prompt: None,
+                options,
+                mode_override: None,
+                agent: None,
+                is_explicit_name: false,
+                prompt_file_only: false,
+                fork_source: None,
+            },
+            false,
+        )
+        .unwrap();
+        let worktree_path = result.worktree_path.clone();
+        assert!(worktree_path.exists());
+
+        // Sanity: the workspace and bookmark exist before removal.
+        assert!(
+            ctx.vcs
+                .list_workspaces_in(Some(&repo))
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name.as_deref() == Some("jj-round-trip"))
+        );
+        assert!(
+            ctx.vcs
+                .branch_exists_in("jj-round-trip", Some(&repo))
+                .unwrap()
+        );
+
+        let remove_result = super::super::remove("jj-round-trip", true, false, &ctx).unwrap();
+        assert_eq!(remove_result.branch_removed, "jj-round-trip");
+        assert!(!remove_result.cleanup_scheduled);
+
+        // The workspace directory is gone from disk.
+        assert!(!worktree_path.exists());
+
+        // The workspace registration was forgotten and the bookmark deleted.
+        assert!(
+            !ctx.vcs
+                .list_workspaces_in(Some(&repo))
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name.as_deref() == Some("jj-round-trip"))
+        );
+        assert!(
+            !ctx.vcs
+                .branch_exists_in("jj-round-trip", Some(&repo))
+                .unwrap()
+        );
+
+        // Workmux's own per-worktree metadata for the handle was removed.
+        // `branch_base` is keyed by branch name rather than handle and is
+        // deliberately left behind by `WorkmuxMetaStore::remove_all_at` for
+        // both backends (confirmed against `GitBackend`:
+        // `git::remove_worktree_meta_at`'s key pattern only ever matches
+        // `workmux.worktree.<handle>.*`, never `workmux.branch.<branch>.*`)
+        // - so it is asserted preserved here, not removed.
+        assert_eq!(
+            ctx.vcs.meta().get_branch_base("jj-round-trip", Some(&repo)),
+            Some("main".to_string())
+        );
+        assert_eq!(
+            ctx.vcs
+                .meta()
+                .get("jj-round-trip", "attachment", Some(&repo)),
+            None
+        );
     }
 }

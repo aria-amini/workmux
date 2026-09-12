@@ -157,11 +157,12 @@ fn stdin_has_data(_stdin: &std::io::Stdin) -> Result<bool> {
 /// Check preconditions for the add command (git repo and multiplexer session).
 /// Returns Ok(()) if all preconditions are met, or an error listing all failures.
 fn check_preconditions(headless: bool) -> Result<()> {
-    let is_git = git::is_git_repo()?;
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    let is_repo = crate::vcs::detect::detect_repo_kind_in(&cwd) != crate::vcs::RepoKind::None;
     let mux = create_backend(detect_backend());
     let is_mux_running = headless || mux.is_running()?;
 
-    if is_git && is_mux_running {
+    if is_repo && is_mux_running {
         return Ok(());
     }
 
@@ -170,8 +171,8 @@ fn check_preconditions(headless: bool) -> Result<()> {
     if !is_mux_running {
         errors.push(format!("{} is not running.", mux.name()));
     }
-    if !is_git {
-        errors.push("Current directory is not a git repository.".to_string());
+    if !is_repo {
+        errors.push("Current directory is not a git or jj repository.".to_string());
     }
 
     // Add blank line before suggestions
@@ -180,11 +181,19 @@ fn check_preconditions(headless: bool) -> Result<()> {
     if !is_mux_running {
         errors.push(format!("Please start a {} session first.", mux.name()));
     }
-    if !is_git {
-        errors.push("Please run this command from within a git repository.".to_string());
+    if !is_repo {
+        errors.push("Please run this command from within a git or jj repository.".to_string());
     }
 
     Err(anyhow!(errors.join("\n")))
+}
+
+/// Whether the process's current directory is inside a git-backed repo, as
+/// opposed to jj or no repo at all. Used to gate the remote-branch-detection
+/// call sites below, which have no jj analog yet.
+fn current_dir_is_git_backend() -> Result<bool> {
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    Ok(crate::vcs::detect::detect_backend_in(&cwd)?.name() == "git")
 }
 
 /// Resolve a named layout by replacing `config.panes` with the layout's panes.
@@ -294,7 +303,11 @@ fn run_headless(
     }
     let handle = crate::naming::derive_handle(branch_name, name, &context.config)?;
     let configured_base = if base.is_none() {
-        workflow::resolve_configured_base_branch(&context.config, &context.execution_dir)?
+        workflow::resolve_configured_base_branch(
+            &context.config,
+            &context.execution_dir,
+            context.vcs.as_ref(),
+        )?
     } else {
         None
     };
@@ -468,7 +481,8 @@ pub fn run(
             })?;
 
         // Use worktree root (not cwd) so subdirectory invocation works correctly
-        let source_path = git::get_repo_root()?;
+        let cwd = std::env::current_dir().context("Failed to get current directory")?;
+        let source_path = crate::vcs::detect::detect_backend_in(&cwd)?.get_repo_root_in(None)?;
         let session = if fork_arg.is_empty() {
             // --fork without value: use most recent
             forker
@@ -738,6 +752,16 @@ pub fn run(
     let (remote_branch, template_base_name) = if let Some(ref pr_remote) = remote_branch_for_pr {
         (Some(pr_remote.clone()), branch_name.to_string())
     } else if auto_name {
+        (None, branch_name.to_string())
+    } else if !current_dir_is_git_backend()? {
+        // `detect_remote_branch`/`detect_remote_branch_dry_run` both shell
+        // out to `git::list_remotes()` (implicit cwd) unconditionally, which
+        // errors outright in a jj-only repo (no `.git` at all, even
+        // colocated jj never puts one at a secondary workspace's root) -
+        // jj has no "remote/branch" bookmark-detection analog in v1, so
+        // treat every branch name as local here, matching --headless's
+        // existing "treats branch names as local" behavior for slash-free
+        // names (see `run_headless` above).
         (None, branch_name.to_string())
     } else if dry_run {
         detect_remote_branch_dry_run(branch_name, cli_base)?
@@ -1078,7 +1102,11 @@ impl<'a> CreationPlan<'a> {
             // Create a WorkflowContext for this spec's config (reuse shared mux)
             let context = workflow::WorkflowContext::new(config, mux.clone(), config_location)?;
             let configured_base = if self.resolved_base.is_none() && self.remote_branch.is_none() {
-                workflow::resolve_configured_base_branch(&context.config, &context.execution_dir)?
+                workflow::resolve_configured_base_branch(
+                    &context.config,
+                    &context.execution_dir,
+                    context.vcs.as_ref(),
+                )?
             } else {
                 None
             };

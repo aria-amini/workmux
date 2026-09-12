@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::info;
 
 use crate::config::{self, MuxMode};
-use crate::git;
 use crate::multiplexer::Multiplexer;
 #[cfg(test)]
 use crate::state::PaneKey;
@@ -64,8 +63,19 @@ pub fn plan(store: &StateStore, mux: &dyn Multiplexer) -> Result<ResurrectPlan> 
     );
 
     // Get worktrees for current repo
-    let worktrees = git::list_worktrees()?;
-    let main_root = git::get_main_worktree_root()?;
+    let cwd = std::env::current_dir().context("Failed to determine current directory")?;
+    let vcs = crate::vcs::detect::detect_backend_in(&cwd)?;
+    let worktrees: Vec<(PathBuf, String)> = vcs
+        .list_workspaces_in(Some(&cwd))?
+        .into_iter()
+        .map(|entry| {
+            let branch = entry
+                .branch_or_bookmark
+                .unwrap_or_else(|| "(detached)".to_string());
+            (entry.path, branch)
+        })
+        .collect();
+    let main_root = vcs.get_main_worktree_root_in(Some(&cwd))?;
     let canon_main = canon_or_self(&main_root);
 
     // Build canonical worktree map: (canon_path, handle)
@@ -110,7 +120,10 @@ pub fn plan(store: &StateStore, mux: &dyn Multiplexer) -> Result<ResurrectPlan> 
             .find(|(canon_wt, _)| canon_agent == *canon_wt || canon_agent.starts_with(canon_wt));
 
         match matched {
-            Some((_canon_wt, handle)) if !git::get_worktree_attachment(handle).manages_mux() => {
+            Some((_canon_wt, handle))
+                if !super::meta::get_attachment(vcs.as_ref(), handle.as_str(), Some(&cwd))
+                    .manages_mux() =>
+            {
                 unmatched_states += 1;
             }
             Some((_canon_wt, handle)) => {
@@ -122,7 +135,8 @@ pub fn plan(store: &StateStore, mux: &dyn Multiplexer) -> Result<ResurrectPlan> 
                     status = ?agent.status,
                     "resurrect:plan matched agent to worktree"
                 );
-                let mode = git::get_worktree_mode_opt(handle).unwrap_or(default_mode);
+                let mode = super::meta::get_mode_opt(vcs.as_ref(), handle.as_str(), Some(&cwd))
+                    .unwrap_or(default_mode);
                 let entry = by_handle
                     .entry(handle.clone())
                     .or_insert_with(|| (mode, None, Vec::new()));
@@ -153,20 +167,27 @@ pub fn plan(store: &StateStore, mux: &dyn Multiplexer) -> Result<ResurrectPlan> 
             ResurrectAction::SkipMain
         } else {
             let target_name = if mode == MuxMode::Session {
-                git::get_worktree_target_session(&handle).unwrap_or_else(|| handle.clone())
+                super::meta::get_target_session(vcs.as_ref(), handle.as_str(), Some(&cwd))
+                    .unwrap_or_else(|| handle.clone())
             } else {
-                git::get_worktree_target_window(&handle).unwrap_or_else(|| handle.clone())
+                super::meta::get_target_window(vcs.as_ref(), handle.as_str(), Some(&cwd))
+                    .unwrap_or_else(|| handle.clone())
             };
             let prefixed = crate::multiplexer::util::prefixed(prefix, &target_name);
             let is_open = if mode == MuxMode::Session {
                 mux_sessions.contains(&prefixed)
             } else if mux.supports_window_ownership() {
-                match git::get_worktree_window_token(&handle) {
+                match super::meta::get_window_token(vcs.as_ref(), handle.as_str(), Some(&cwd)) {
                     Some(token) => !mux
                         .resolve_owned_window_targets(
                             &token,
                             &prefixed,
-                            git::get_worktree_window_session(&handle).as_deref(),
+                            super::meta::get_window_session(
+                                vcs.as_ref(),
+                                handle.as_str(),
+                                Some(&cwd),
+                            )
+                            .as_deref(),
                             &canon_wt,
                         )?
                         .is_empty(),

@@ -461,6 +461,7 @@ fn git_status_semantically_equal(a: &GitStatus, b: &GitStatus) -> bool {
         branch: _,
         has_upstream: _,
         is_rebasing: _,
+        head_commit: _,
     } = a;
 
     a.ahead == b.ahead
@@ -703,7 +704,10 @@ fn next_worker_timeout(pending: &HashMap<PathBuf, Instant>, debounce: Duration) 
 /// Refresh git status once for a worktree and publish it for every agent path.
 /// Returns true if any published status changed, ignoring cached_at.
 fn refresh_git_status(worktree: &Path, agent_paths: &[PathBuf], cache: &GitCache) -> bool {
-    let new_status = crate::git::get_git_status(worktree, None);
+    let new_status = crate::vcs::detect::detect_backend_in(worktree)
+        .ok()
+        .and_then(|vcs| vcs.get_status(worktree, None).ok())
+        .unwrap_or_else(|| crate::git::get_git_status(worktree, None));
     let Ok(mut cache) = cache.lock() else {
         return true;
     };
@@ -810,8 +814,9 @@ fn resolve_git_worktrees_cached(
     let mut worktrees: HashMap<PathBuf, ResolvedGitWorktree> = HashMap::new();
     for entry in entries {
         let root = roots_by_agent.entry(entry.path.clone()).or_insert_with(|| {
-            crate::git::get_repo_root_for(&entry.path)
+            crate::vcs::detect::detect_backend_in(&entry.path)
                 .ok()
+                .and_then(|vcs| vcs.get_repo_root_in(Some(&entry.path)).ok())
                 .map(|root| crate::util::canon_or_self(&root))
         });
         let Some(root) = root else {
@@ -855,8 +860,9 @@ fn github_fetch_due(branch_set_changed: bool, elapsed: Duration) -> bool {
 }
 
 fn github_repo_key(path: &Path) -> Option<PathBuf> {
-    crate::git::get_git_common_dir_in(Some(path))
+    crate::vcs::detect::detect_backend_in(path)
         .ok()
+        .and_then(|vcs| vcs.get_common_dir_in(Some(path)).ok())
         .and_then(|git_dir| git_dir.canonicalize().ok().or(Some(git_dir)))
 }
 

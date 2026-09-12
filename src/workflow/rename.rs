@@ -19,6 +19,16 @@ pub fn rename(
     rename_branch: bool,
     context: &WorkflowContext,
 ) -> Result<RenameResult> {
+    // jj records each workspace's root path in the repository and has no
+    // primitive to update it after a move, so a renamed directory would
+    // leave a permanently dangling workspace registration.
+    if context.vcs.name() == "jj" {
+        return Err(anyhow!(
+            "Renaming worktrees is not supported in jj repositories.\n\n\
+             Equivalent: 'workmux remove {user_target}' followed by 'workmux add <new-name>'."
+        ));
+    }
+
     // 1. Resolve source worktree. `user_target` may be a handle OR a branch;
     //    `find_worktree` handles both. Always derive the authoritative handle
     //    from the worktree's directory basename to keep metadata/tmux/state

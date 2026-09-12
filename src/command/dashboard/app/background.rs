@@ -45,7 +45,10 @@ impl App {
             let _reset = ResetFlag(is_fetching);
 
             for path in paths {
-                let status = git::get_git_status(&path, main_branch.as_deref());
+                let status = crate::vcs::detect::detect_backend_in(&path)
+                    .ok()
+                    .and_then(|vcs| vcs.get_status(&path, main_branch.as_deref()).ok())
+                    .unwrap_or_else(|| git::get_git_status(&path, main_branch.as_deref()));
                 let _ = tx.send(AppEvent::GitStatus(path, status));
             }
         });
