@@ -127,13 +127,6 @@ pub fn parse_fork_branch_spec(input: &str) -> Option<ForkBranchSpec> {
     })
 }
 
-/// Get the current branch name
-pub fn get_current_branch() -> Result<String> {
-    Cmd::new("git")
-        .args(&["branch", "--show-current"])
-        .run_and_capture_stdout()
-}
-
 /// Get the current branch in a specific workdir
 pub fn get_current_branch_in(workdir: &Path) -> Result<String> {
     Cmd::new("git")
@@ -346,11 +339,6 @@ pub(super) fn branch_has_upstream_in(branch_name: &str, workdir: Option<&Path>) 
         None => has_remote_cmd,
     };
     has_remote_cmd.run_as_check()
-}
-
-/// Store the base branch/commit that a branch was created from
-pub fn set_branch_base(branch: &str, base: &str) -> Result<()> {
-    set_branch_base_in(branch, base, None)
 }
 
 /// Store the base branch/commit in a specific workdir

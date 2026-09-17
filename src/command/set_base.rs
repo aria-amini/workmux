@@ -1,22 +1,23 @@
-use crate::git;
 use anyhow::{Context, Result, anyhow};
 
 pub fn run(base: &str) -> Result<()> {
-    if !git::branch_exists(base)? {
+    let cwd = std::env::current_dir().context("Failed to determine current directory")?;
+    let vcs = crate::vcs::detect::detect_backend_in(&cwd)?;
+
+    if !vcs.branch_exists_in(base, Some(&cwd))? {
         return Err(anyhow!("Base reference '{}' does not exist", base));
     }
 
-    let branch = git::get_current_branch().context("Failed to get current branch")?;
-
-    if branch.is_empty() {
-        return Err(anyhow!("Not on a branch (detached HEAD?)"));
-    }
+    let branch = vcs
+        .get_current_branch_in(&cwd)?
+        .context("Not on a branch or bookmark")?;
 
     if branch == base {
         return Err(anyhow!("Cannot set base branch to the current branch"));
     }
 
-    git::set_branch_base(&branch, base)
+    vcs.meta()
+        .set_branch_base(&branch, base, Some(&cwd))
         .with_context(|| format!("Failed to set base branch for '{}'", branch))?;
 
     println!("Set base branch for '{}' to '{}'", branch, base);

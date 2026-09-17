@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use std::path::Path;
 
 use crate::{cmd, git};
 use tracing::{debug, info};
@@ -32,6 +33,23 @@ pub fn merge(
         no_hooks,
         "merge:start"
     );
+
+    // jj drives merges repository-wide with different primitives; dispatch
+    // before touching any git-specific state.
+    if context.vcs.name() == "jj" {
+        return super::merge_jj::merge(
+            name,
+            into_branch,
+            rebase,
+            squash,
+            keep,
+            ignore_uncommitted,
+            no_verify,
+            no_hooks,
+            notification,
+            context,
+        );
+    }
 
     // Change CWD to main worktree to prevent errors if the command is run from within
     // the worktree that is about to be deleted.
@@ -209,42 +227,15 @@ pub fn merge(
 
     // Run pre-merge hooks after all validations pass but before any merge operations begin.
     // Skip hooks if --no-verify or --no-hooks flag is passed.
-    if !no_verify
-        && !no_hooks
-        && let Some(hooks) = &context.config.pre_merge
-        && !hooks.is_empty()
-    {
-        info!(count = hooks.len(), "merge:running pre-merge hooks");
-
-        let abs_worktree_path = worktree_path
-            .canonicalize()
-            .unwrap_or_else(|_| worktree_path.clone());
-        let abs_project_root = context
-            .main_worktree_root
-            .canonicalize()
-            .unwrap_or_else(|_| context.main_worktree_root.clone());
-        let worktree_path_str = abs_worktree_path.to_string_lossy();
-        let project_root_str = abs_project_root.to_string_lossy();
-
-        let hook_env = [
-            ("WORKMUX_HANDLE", handle),
-            ("WM_BRANCH_NAME", branch_to_merge.as_str()),
-            ("WM_TARGET_BRANCH", target_branch),
-            ("WM_WORKTREE_PATH", worktree_path_str.as_ref()),
-            ("WM_PROJECT_ROOT", project_root_str.as_ref()),
-            ("WM_HANDLE", handle),
-        ];
-
-        for command in hooks {
-            cmd::shell_command_with_env(
-                context.config.hook_shell.as_deref(),
-                command,
-                &worktree_path,
-                &hook_env,
-            )
-            .with_context(|| format!("Pre-merge hook failed: '{}'", command))?;
-        }
-    }
+    run_pre_merge_hooks(
+        context,
+        handle,
+        branch_to_merge.as_str(),
+        target_branch,
+        &worktree_path,
+        no_verify,
+        no_hooks,
+    )?;
 
     // Helper closure to generate the error message for merge conflicts
     let conflict_err = |branch: &str| -> anyhow::Error {
@@ -386,8 +377,64 @@ pub fn merge(
     })
 }
 
+/// Run pre-merge hooks after all validations pass but before any merge
+/// operations begin. Skipped with --no-verify or --no-hooks. Shared by the
+/// git and jj merge flows; the hook environment is identical.
+pub(super) fn run_pre_merge_hooks(
+    context: &WorkflowContext,
+    handle: &str,
+    branch_to_merge: &str,
+    target_branch: &str,
+    worktree_path: &Path,
+    no_verify: bool,
+    no_hooks: bool,
+) -> Result<()> {
+    if no_verify
+        || no_hooks
+        || context
+            .config
+            .pre_merge
+            .as_ref()
+            .is_none_or(|hooks| hooks.is_empty())
+    {
+        return Ok(());
+    }
+    let hooks = context.config.pre_merge.as_deref().unwrap_or_default();
+    info!(count = hooks.len(), "merge:running pre-merge hooks");
+
+    let abs_worktree_path = worktree_path
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_path.to_path_buf());
+    let abs_project_root = context
+        .main_worktree_root
+        .canonicalize()
+        .unwrap_or_else(|_| context.main_worktree_root.clone());
+    let worktree_path_str = abs_worktree_path.to_string_lossy();
+    let project_root_str = abs_project_root.to_string_lossy();
+
+    let hook_env = [
+        ("WORKMUX_HANDLE", handle),
+        ("WM_BRANCH_NAME", branch_to_merge),
+        ("WM_TARGET_BRANCH", target_branch),
+        ("WM_WORKTREE_PATH", worktree_path_str.as_ref()),
+        ("WM_PROJECT_ROOT", project_root_str.as_ref()),
+        ("WM_HANDLE", handle),
+    ];
+
+    for command in hooks {
+        cmd::shell_command_with_env(
+            context.config.hook_shell.as_deref(),
+            command,
+            worktree_path,
+            &hook_env,
+        )
+        .with_context(|| format!("Pre-merge hook failed: '{}'", command))?;
+    }
+    Ok(())
+}
+
 /// Shows a system notification on macOS or Linux
-fn show_notification(message: &str) {
+pub(super) fn show_notification(message: &str) {
     #[cfg(target_os = "macos")]
     {
         use mac_notification_sys::{Notification, set_application};
