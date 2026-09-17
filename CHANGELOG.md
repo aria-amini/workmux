@@ -21,6 +21,11 @@ editUrl: https://github.com/raine/workmux/edit/main/CHANGELOG.md
 <!-- skipped: v0.1.25 -->
 <!-- skipped: v0.1.8 -->
 
+## v0.1.263-jj.1 (2026-09-17)
+
+- Add jujutsu (jj) support: `add`, `remove`, `status`, `list`, `open`, `close`, `merge`, `rebase`, and `set-base` now work on jj and colocated git repositories, behind a VCS backend abstraction with repository detection and a per-repository workmux metadata store for jj repos.
+- Document jj support and its current boundaries in a new guide; install jj in CI and the sandbox image.
+
 ## v0.1.263 (2026-09-16)
 
 - Fix dashboard removal and sweep actions targeting the wrong worktree when managing multiple projects. ([#272](https://github.com/raine/workmux/pull/272))
