@@ -19,7 +19,8 @@ env:
 
 jobs:
   setup:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    # Fork: publishing to the upstream ghcr.io registry cannot work here.
+    if: false
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
