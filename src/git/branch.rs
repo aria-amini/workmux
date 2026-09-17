@@ -7,11 +7,6 @@ use crate::cmd::Cmd;
 
 use super::{ForkBranchSpec, RemoteBranchSpec};
 
-/// Get the default branch (main or master)
-pub fn get_default_branch() -> Result<String> {
-    get_default_branch_in(None)
-}
-
 /// Get the default branch for a repository at a specific path
 pub fn get_default_branch_in(workdir: Option<&Path>) -> Result<String> {
     // Try to get the default branch from the remote
@@ -230,11 +225,6 @@ pub fn delete_branch_in(branch_name: &str, force: bool, git_common_dir: &Path) -
     Ok(())
 }
 
-/// Get the base branch for merge checks, preferring local branch over remote
-pub fn get_merge_base(main_branch: &str) -> Result<String> {
-    get_merge_base_in(None, main_branch)
-}
-
 /// Get the base branch for merge checks in a specific workdir
 pub fn get_merge_base_in(workdir: Option<&Path>, main_branch: &str) -> Result<String> {
     // Check if the local branch exists first.
@@ -251,11 +241,6 @@ pub fn get_merge_base_in(workdir: Option<&Path>, main_branch: &str) -> Result<St
     } else {
         Ok(main_branch.to_string())
     }
-}
-
-/// Get a set of all branches not merged into the base branch
-pub fn get_unmerged_branches(base_branch: &str) -> Result<HashSet<String>> {
-    get_unmerged_branches_in(None, base_branch)
 }
 
 /// Get a set of all branches not merged into the base branch in a specific workdir
@@ -292,16 +277,6 @@ pub fn get_unmerged_branches_in(
             }
         }
     }
-}
-
-/// Get the branch name for a worktree at a specific path.
-///
-/// Runs `git branch --show-current` in the worktree's directory.
-pub fn get_branch_for_worktree(worktree_path: &Path) -> Result<String> {
-    Cmd::new("git")
-        .workdir(worktree_path)
-        .args(&["branch", "--show-current"])
-        .run_and_capture_stdout()
 }
 
 /// Get a set of branches whose upstream remote-tracking branch has been deleted.

@@ -31,15 +31,6 @@ pub fn has_missing_admin_dir(worktree_path: &Path) -> bool {
 }
 
 /// Check if the worktree has uncommitted changes
-pub fn has_uncommitted_changes(worktree_path: &Path) -> Result<bool> {
-    let output = bg_git()
-        .workdir(worktree_path)
-        .args(&["status", "--porcelain"])
-        .run_and_capture_stdout()?;
-
-    Ok(!output.is_empty())
-}
-
 /// Check if the worktree has tracked changes (staged or modified)
 /// This excludes untracked files
 pub fn has_tracked_changes(worktree_path: &Path) -> Result<bool> {

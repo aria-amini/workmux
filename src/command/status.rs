@@ -156,7 +156,7 @@ fn status_entry(
     now: u64,
     git: Option<GitInfo>,
 ) -> StatusEntry {
-    let (project, project_path) = git::project_identity(&agent.path);
+    let (project, project_path) = backend_project_identity(&agent.path);
     StatusEntry {
         worktree,
         branch,
@@ -175,22 +175,59 @@ fn status_entry(
     }
 }
 
+/// Backend-agnostic analog of `git::project_identity`.
+fn backend_project_identity(
+    path: &std::path::Path,
+) -> (Option<String>, Option<std::path::PathBuf>) {
+    let vcs = match crate::vcs::detect::detect_backend_in(path) {
+        Ok(vcs) => vcs,
+        Err(_) => return (None, None),
+    };
+    let Ok(root) = vcs.get_main_worktree_root_in(Some(path)) else {
+        return (None, None);
+    };
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    (name, Some(root))
+}
+
 /// Compute git info for a worktree path.
 ///
-/// Runs git commands with the worktree's directory as the working dir,
-/// so it works correctly for cross-project agents.
+/// Detects the backend for the worktree's directory (agents may live in
+/// other projects), so it works correctly for cross-project agents.
 fn compute_git_info(wt_path: &std::path::Path, branch: &str) -> Result<GitInfo> {
-    let has_staged = git::has_staged_changes(wt_path)?;
-    let has_unstaged = git::has_unstaged_changes(wt_path)?;
-    let main = git::get_default_branch_in(Some(wt_path))?;
-    let base = git::get_merge_base_in(Some(wt_path), &main)?;
-    let unmerged = git::get_unmerged_branches_in(Some(wt_path), &base)?;
+    let vcs = crate::vcs::detect::detect_backend_in(wt_path)?;
+    if vcs.name() == "git" {
+        let has_staged = git::has_staged_changes(wt_path)?;
+        let has_unstaged = git::has_unstaged_changes(wt_path)?;
+        let main = git::get_default_branch_in(Some(wt_path))?;
+        let base = git::get_merge_base_in(Some(wt_path), &main)?;
+        let unmerged = git::get_unmerged_branches_in(Some(wt_path), &base)?;
+        return Ok(GitInfo {
+            has_staged,
+            has_unstaged,
+            has_unmerged_commits: unmerged.contains(branch),
+        });
+    }
 
+    // jj: no index, so "unstaged" means the working-copy commit differs
+    // from its parent, and "staged" does not exist. Unmerged detection has
+    // no backend equivalent yet.
+    let status = vcs.get_status(wt_path, None)?;
     Ok(GitInfo {
-        has_staged,
-        has_unstaged,
-        has_unmerged_commits: unmerged.contains(branch),
+        has_staged: false,
+        has_unstaged: status.is_dirty,
+        has_unmerged_commits: false,
     })
+}
+
+/// Branch/bookmark for a worktree via the backend, with git's detached
+/// placeholder for an anonymous working copy.
+fn backend_branch(wt_path: &std::path::Path) -> Result<String> {
+    let vcs = crate::vcs::detect::detect_backend_in(wt_path)?;
+    let branch = vcs.get_current_branch_in(wt_path)?;
+    Ok(branch.unwrap_or_else(|| "(detached)".to_string()))
 }
 
 pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Result<()> {
@@ -214,25 +251,44 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // Repository scope for the process's current directory, if any.
+    let cwd = std::env::current_dir()?;
+    let cwd_vcs = crate::vcs::detect::detect_backend_in(&cwd).ok();
+    let in_repo = cwd_vcs
+        .as_ref()
+        .is_some_and(|vcs| vcs.is_repo_in(Some(&cwd)).unwrap_or(false));
+
     let reconciled_agent_count = agent_panes.len();
     let mut entries: Vec<StatusEntry> = Vec::new();
     let mut target_errors = Vec::new();
     let repository;
 
     if worktrees.is_empty() {
-        if !all && git::get_repo_root_if_present()?.is_some() {
-            let all_worktrees = git::list_worktrees()?;
-            repository = Some(git::get_main_worktree_root()?);
+        if !all && in_repo {
+            let vcs = cwd_vcs.as_ref().expect("in_repo implies a backend");
+            let all_worktrees: Vec<(std::path::PathBuf, String)> = vcs
+                .list_workspaces_in(Some(&cwd))?
+                .into_iter()
+                .map(|entry| {
+                    let branch = entry
+                        .branch_or_bookmark
+                        .unwrap_or_else(|| "(detached)".to_string());
+                    (entry.path, branch)
+                })
+                .collect();
+            repository = Some(vcs.get_main_worktree_root_in(Some(&cwd))?);
             let has_scoped_agents = all_worktrees.iter().any(|(wt_path, _)| {
                 !workflow::match_agents_to_worktree(&agent_panes, wt_path).is_empty()
             });
-            let unmerged_branches = if show_git && has_scoped_agents {
-                let main = git::get_default_branch()?;
-                let base = git::get_merge_base(&main)?;
-                git::get_unmerged_branches(&base)?
-            } else {
-                std::collections::HashSet::new()
-            };
+            let unmerged_branches: std::collections::HashSet<String> =
+                if show_git && has_scoped_agents {
+                    let main = vcs.get_default_branch_in(Some(&cwd))?;
+                    let base = vcs.get_merge_base_in(Some(&cwd), &main)?;
+                    vcs.get_unmerged_branches_in(Some(&cwd), &base)?
+                        .unwrap_or_default()
+                } else {
+                    std::collections::HashSet::new()
+                };
 
             for (wt_path, branch) in &all_worktrees {
                 let matching = workflow::match_agents_to_worktree(&agent_panes, wt_path);
@@ -274,7 +330,7 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
                     .and_then(|name| name.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let branch = match git::get_branch_for_worktree(&worktree_path) {
+                let branch = match backend_branch(&worktree_path) {
                     Ok(branch) => normalized_branch(branch),
                     Err(error) if show_git => return Err(error),
                     Err(_) => worktree_name.clone(),
@@ -288,8 +344,13 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
             }
         }
     } else {
-        repository = if git::get_repo_root_if_present()?.is_some() {
-            Some(git::get_main_worktree_root()?)
+        repository = if in_repo {
+            Some(
+                cwd_vcs
+                    .as_ref()
+                    .expect("in_repo implies a backend")
+                    .get_main_worktree_root_in(Some(&cwd))?,
+            )
         } else {
             None
         };
@@ -314,7 +375,7 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
                 .and_then(|name| name.to_str())
                 .unwrap_or("unknown")
                 .to_string();
-            let branch = match git::get_branch_for_worktree(&wt_path) {
+            let branch = match backend_branch(&wt_path) {
                 Ok(branch) => branch,
                 Err(error) if show_git => return Err(error),
                 Err(_) => worktree_name.clone(),

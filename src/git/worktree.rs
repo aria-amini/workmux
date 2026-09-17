@@ -405,10 +405,6 @@ pub fn get_worktree_meta_in(handle: &str, key: &str, workdir: Option<&Path>) -> 
     cmd.run_and_capture_stdout().ok().filter(|s| !s.is_empty())
 }
 
-pub fn get_worktree_attachment(handle: &str) -> WorktreeAttachment {
-    get_worktree_attachment_in(handle, None)
-}
-
 pub fn get_worktree_attachment_in(handle: &str, workdir: Option<&Path>) -> WorktreeAttachment {
     match get_worktree_meta_in(handle, "attachment", workdir).as_deref() {
         Some("headless") => WorktreeAttachment::Headless,
@@ -416,65 +412,6 @@ pub fn get_worktree_attachment_in(handle: &str, workdir: Option<&Path>) -> Workt
         Some(_) => WorktreeAttachment::Unknown,
         None => WorktreeAttachment::Legacy,
     }
-}
-
-pub fn set_worktree_attachment_in(
-    handle: &str,
-    attachment: WorktreeAttachment,
-    workdir: Option<&Path>,
-) -> Result<()> {
-    let value = match attachment {
-        WorktreeAttachment::Headless => "headless",
-        WorktreeAttachment::Multiplexer => "multiplexer",
-        WorktreeAttachment::Legacy | WorktreeAttachment::Unknown => {
-            return Err(anyhow!("Only explicit attachment state can be persisted"));
-        }
-    };
-    set_worktree_meta_in(handle, "attachment", value, workdir)
-}
-
-pub fn get_worktree_window_token(handle: &str) -> Option<String> {
-    get_worktree_meta_in(handle, "window-token", None)
-}
-
-pub fn get_worktree_window_token_in(handle: &str, workdir: Option<&Path>) -> Option<String> {
-    get_worktree_meta_in(handle, "window-token", workdir)
-}
-
-pub fn ensure_worktree_window_token_in(handle: &str, workdir: Option<&Path>) -> Result<String> {
-    if let Some(token) = get_worktree_window_token_in(handle, workdir) {
-        return Ok(token);
-    }
-
-    let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).context("Failed to generate worktree window token")?;
-    let token: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    set_worktree_meta_in(handle, "window-token", &token, workdir)?;
-    Ok(token)
-}
-
-pub fn get_worktree_target_window(handle: &str) -> Option<String> {
-    get_worktree_target_window_in(handle, None)
-}
-
-pub fn get_worktree_target_window_in(handle: &str, workdir: Option<&Path>) -> Option<String> {
-    get_worktree_meta_in(handle, "target-window", workdir)
-}
-
-pub fn get_worktree_target_session(handle: &str) -> Option<String> {
-    get_worktree_target_session_in(handle, None)
-}
-
-pub fn get_worktree_target_session_in(handle: &str, workdir: Option<&Path>) -> Option<String> {
-    get_worktree_meta_in(handle, "target-session", workdir)
-}
-
-pub fn get_worktree_window_session(handle: &str) -> Option<String> {
-    get_worktree_window_session_in(handle, None)
-}
-
-pub fn get_worktree_window_session_in(handle: &str, workdir: Option<&Path>) -> Option<String> {
-    get_worktree_meta_in(handle, "window-session", workdir)
 }
 
 /// Determine the tmux mode for a worktree from git metadata.
@@ -525,45 +462,6 @@ pub fn get_all_worktree_meta_key_in(
         }
     }
     values
-}
-
-/// Batch-load all worktree modes, optionally in a specific workdir.
-pub fn get_all_worktree_modes_in(
-    workdir: Option<&Path>,
-) -> std::collections::HashMap<String, MuxMode> {
-    let cmd = Cmd::new("git").args(&[
-        "config",
-        "--local",
-        "--get-regexp",
-        r"^workmux\.worktree\..*\.mode$",
-    ]);
-    let cmd = match workdir {
-        Some(path) => cmd.workdir(path),
-        None => cmd,
-    };
-    let output = cmd.run_and_capture_stdout().unwrap_or_default();
-
-    let mut modes = std::collections::HashMap::new();
-    for line in output.lines() {
-        // Format: "workmux.worktree.<handle>.mode <value>"
-        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-        if parts.len() == 2 {
-            let key = parts[0];
-            let value = parts[1].trim();
-            // Extract handle from "workmux.worktree.<handle>.mode"
-            if let Some(rest) = key.strip_prefix("workmux.worktree.")
-                && let Some(handle) = rest.strip_suffix(".mode")
-            {
-                let mode = if value == "session" {
-                    MuxMode::Session
-                } else {
-                    MuxMode::Window
-                };
-                modes.insert(handle.to_string(), mode);
-            }
-        }
-    }
-    modes
 }
 
 /// Remove worktree metadata using an explicitly identified repository.

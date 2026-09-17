@@ -8,8 +8,8 @@ use crate::config::MuxMode;
 use crate::multiplexer::{AgentStatus, create_backend, detect_backend};
 use crate::util::format_compact_age;
 use crate::workflow::types::AgentStatusSummary;
-use crate::{git, nerdfont, workflow};
-use anyhow::Result;
+use crate::{nerdfont, workflow};
+use anyhow::{Context, Result};
 use pathdiff::diff_paths;
 use serde::Serialize;
 use tabled::{
@@ -171,7 +171,11 @@ fn discover_project_roots(mux: &dyn crate::multiplexer::Multiplexer) -> Result<V
     let agents = crate::state::StateStore::new()?.load_reconciled_agents(mux)?;
     let roots: BTreeSet<PathBuf> = agents
         .iter()
-        .filter_map(|agent| git::get_main_worktree_root_in(Some(&agent.path)).ok())
+        .filter_map(|agent| {
+            crate::vcs::detect::detect_backend_in(&agent.path)
+                .ok()
+                .and_then(|vcs| vcs.get_main_worktree_root_in(Some(&agent.path)).ok())
+        })
         .map(|root| crate::util::canon_or_self(&root))
         .collect();
     Ok(roots.into_iter().collect())
@@ -205,7 +209,9 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
             worktrees.extend(list_project(&root, mux.as_ref(), show_pr && !json, filter)?);
         }
     } else {
-        let root = git::get_main_worktree_root()?;
+        let cwd = std::env::current_dir().context("Failed to determine current directory")?;
+        let vcs = crate::vcs::detect::detect_backend_in(&cwd)?;
+        let root = vcs.get_main_worktree_root_in(Some(&cwd))?;
         let project = project_name(&root);
         worktrees.extend(
             workflow::list(&display_config, mux.as_ref(), show_pr && !json, filter)?
@@ -243,7 +249,11 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
                         MuxMode::Window => "window".to_string(),
                         MuxMode::Session => "session".to_string(),
                     },
-                    has_uncommitted_changes: git::has_uncommitted_changes(&wt.path).unwrap_or(true),
+                    has_uncommitted_changes: crate::vcs::detect::detect_backend_in(&wt.path)
+                        .ok()
+                        .and_then(|vcs| vcs.get_status(&wt.path, None).ok())
+                        .map(|status| status.is_dirty)
+                        .unwrap_or(true),
                     is_open: wt.has_mux_window,
                     agent_statuses: wt
                         .agent_status

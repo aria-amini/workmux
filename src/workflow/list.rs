@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -6,7 +6,7 @@ use crate::config::MuxMode;
 use crate::multiplexer::{Multiplexer, util};
 use crate::state::StateStore;
 use crate::util::canon_or_self;
-use crate::{config, git, github, spinner};
+use crate::{config, github, spinner};
 
 use super::types::{AgentStatusSummary, WorktreeInfo};
 
@@ -68,18 +68,32 @@ pub fn list_in(
     filter: &[String],
     repo: Option<&Path>,
 ) -> Result<Vec<WorktreeInfo>> {
-    if repo.is_none() && !git::is_git_repo()? {
-        return Err(anyhow!("Not in a git repository"));
+    let workdir = match repo {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().context("Failed to determine current directory")?,
+    };
+    let vcs = crate::vcs::detect::detect_backend_in(&workdir)?;
+    if !vcs.is_repo_in(Some(&workdir))? {
+        return Err(anyhow!("Not in a supported repository"));
     }
 
-    let worktrees_data = git::list_worktrees_in(repo)?;
+    let worktrees_data: Vec<(PathBuf, String)> = vcs
+        .list_workspaces_in(repo)?
+        .into_iter()
+        .map(|entry| {
+            let branch = entry
+                .branch_or_bookmark
+                .unwrap_or_else(|| "(detached)".to_string());
+            (entry.path, branch)
+        })
+        .collect();
 
     if worktrees_data.is_empty() {
         return Ok(Vec::new());
     }
 
-    // The first worktree from `git worktree list` is always the main worktree
-    let main_worktree_path = worktrees_data.first().map(|(p, _)| p.clone());
+    // The main worktree/workspace root
+    let main_worktree_path = vcs.get_main_worktree_root_in(repo).ok();
 
     // Apply filter early before expensive operations
     let worktrees_data = filter_worktrees(worktrees_data, filter);
@@ -102,14 +116,15 @@ pub fn list_in(
     };
 
     // Get the main branch for unmerged checks
-    let main_branch = git::get_default_branch_in(repo).ok();
+    let main_branch = vcs.get_default_branch_in(repo).ok();
 
     // Get all unmerged branches in one go for efficiency
     // Prefer checking against remote tracking branch for more accurate results
-    let unmerged_branches = main_branch
+    let unmerged_branches: HashSet<String> = main_branch
         .as_deref()
-        .and_then(|main| git::get_merge_base_in(repo, main).ok())
-        .and_then(|base| git::get_unmerged_branches_in(repo, &base).ok())
+        .and_then(|main| vcs.get_merge_base_in(repo, main).ok())
+        .and_then(|base| vcs.get_unmerged_branches_in(repo, &base).ok())
+        .flatten()
         .unwrap_or_default(); // Use an empty set on failure
 
     // Batch fetch all PRs if requested (single API call)
@@ -137,13 +152,25 @@ pub fn list_in(
         .map(|a| (canon_or_self(&a.path), a.status))
         .collect();
 
-    // Batch-load all worktree modes in a single git config call
-    let worktree_modes = git::get_all_worktree_modes_in(repo);
-    let target_windows = git::get_all_worktree_meta_key_in(repo, "target-window");
-    let target_sessions = git::get_all_worktree_meta_key_in(repo, "target-session");
-    let window_sessions = git::get_all_worktree_meta_key_in(repo, "window-session");
-    let window_tokens = git::get_all_worktree_meta_key_in(repo, "window-token");
-    let attachments = git::get_all_worktree_meta_key_in(repo, "attachment");
+    // Batch-load all worktree modes in a single backend call
+    let worktree_modes: std::collections::HashMap<String, MuxMode> = vcs
+        .meta()
+        .get_all_key(repo, "mode")
+        .into_iter()
+        .map(|(handle, value)| {
+            let mode = if value == "session" {
+                MuxMode::Session
+            } else {
+                MuxMode::Window
+            };
+            (handle, mode)
+        })
+        .collect();
+    let target_windows = vcs.meta().get_all_key(repo, "target-window");
+    let target_sessions = vcs.meta().get_all_key(repo, "target-session");
+    let window_sessions = vcs.meta().get_all_key(repo, "window-session");
+    let window_tokens = vcs.meta().get_all_key(repo, "window-token");
+    let attachments = vcs.meta().get_all_key(repo, "attachment");
     let active_window_tokens = if mux_running {
         mux.owned_window_tokens().unwrap_or_default()
     } else {
@@ -242,7 +269,7 @@ pub fn list_in(
 
             let created_at = crate::creation_time::filesystem_birth_time(&path);
 
-            let base_branch = git::get_branch_base_in(&branch, repo).ok();
+            let base_branch = vcs.meta().get_branch_base(&branch, repo);
 
             WorktreeInfo {
                 handle,
