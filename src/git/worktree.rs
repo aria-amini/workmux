@@ -19,6 +19,22 @@ impl WorktreeAttachment {
     pub fn manages_mux(self) -> bool {
         matches!(self, Self::Multiplexer | Self::Legacy)
     }
+
+    /// The persisted string form of this attachment state, as read back by
+    /// [`get_worktree_attachment_in`]. Only explicit states are persistable.
+    ///
+    /// This is the single source of truth for the serialization; both
+    /// [`set_worktree_attachment_in`] and VCS-backend-routed metadata writes
+    /// go through it so the two can never diverge.
+    pub fn as_meta_value(self) -> Result<&'static str> {
+        match self {
+            Self::Headless => Ok("headless"),
+            Self::Multiplexer => Ok("multiplexer"),
+            Self::Legacy | Self::Unknown => {
+                Err(anyhow!("Only explicit attachment state can be persisted"))
+            }
+        }
+    }
 }
 
 /// Check if a worktree already exists for a branch

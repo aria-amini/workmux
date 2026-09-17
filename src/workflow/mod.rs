@@ -9,6 +9,7 @@ mod create;
 pub mod file_ops;
 mod list;
 mod merge;
+pub mod meta;
 mod open;
 pub mod pr;
 pub mod prompt_loader;
