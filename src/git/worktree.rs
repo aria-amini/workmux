@@ -235,6 +235,34 @@ pub fn worktree_registration_exists_in(
         .any(|(path, _)| path == worktree_path))
 }
 
+pub fn remove_missing_worktree_registration(identity: &super::RepositoryIdentity) -> Result<()> {
+    match std::fs::symlink_metadata(&identity.worktree) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => anyhow::bail!("Worktree path still exists; refusing to remove its registration"),
+    }
+    let Some(admin_dir) =
+        linked_worktree_registration_in(&identity.worktree, &identity.common_dir)?
+    else {
+        return Ok(());
+    };
+    if admin_dir != identity.admin_dir {
+        anyhow::bail!("Git worktree registration changed before removal");
+    }
+    Cmd::new("git")
+        .workdir(&identity.common_dir)
+        .args(&["worktree", "remove", "--"])
+        .arg(
+            identity
+                .worktree
+                .to_str()
+                .context("Invalid worktree path")?,
+        )
+        .run()
+        .context("Failed to remove colocated Git worktree registration")?;
+    Ok(())
+}
+
 /// Prune stale worktree metadata.
 pub fn prune_worktrees_in(git_common_dir: &Path) -> Result<()> {
     Cmd::new("git")
