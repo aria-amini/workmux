@@ -1,0 +1,206 @@
+//! VCS abstraction layer.
+//!
+//! This module provides a trait-based abstraction (mirroring
+//! `crate::multiplexer::Multiplexer`) that allows workmux to work with
+//! different version-control backends (git, jj) interchangeably.
+//!
+//! Both `GitBackend` and `JjBackend` exist; nothing in the rest of the
+//! codebase is wired to use this module yet.
+
+pub mod git_backend;
+pub mod types;
+
+use anyhow::Result;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+#[allow(unused_imports)]
+pub use git_backend::{GitBackend, GitConfigMetaStore};
+pub use types::{CreateWorkspaceOptions, RepoKind, WorkspaceEntry};
+
+/// Re-export of the existing git status struct, unchanged, under a
+/// VCS-neutral alias. The underlying struct (and its fields) lives in
+/// `crate::git::types::GitStatus` and is not modified by this module.
+pub use crate::git::GitStatus as VcsStatus;
+
+/// Main trait for version-control backends (git, jj).
+///
+/// Implementations must be Send + Sync to allow sharing via `Arc<dyn VcsBackend>`.
+pub trait VcsBackend: Send + Sync {
+    /// Returns the name of this backend (e.g., "git", "jj").
+    fn name(&self) -> &'static str;
+
+    /// Check if `workdir` (or the current directory) is inside a repository
+    /// managed by this backend.
+    fn is_repo_in(&self, workdir: Option<&Path>) -> Result<bool>;
+
+    /// Get the main worktree/workspace root directory (not a linked one).
+    fn get_main_worktree_root_in(&self, workdir: Option<&Path>) -> Result<PathBuf>;
+
+    /// Get the root directory of the worktree/workspace *containing*
+    /// `workdir` (or the current directory) — which may be a linked
+    /// worktree/secondary workspace, unlike [`Self::get_main_worktree_root_in`].
+    ///
+    /// This is the VCS-neutral analog of `git rev-parse --show-toplevel`
+    /// (`GitBackend`) / `jj root` (`JjBackend`).
+    fn get_repo_root_in(&self, workdir: Option<&Path>) -> Result<PathBuf>;
+
+    /// Get the common repository directory (shared across all worktrees/workspaces).
+    fn get_common_dir_in(&self, workdir: Option<&Path>) -> Result<PathBuf>;
+
+    /// Check if the repository has any commits.
+    fn has_commits_in(&self, workdir: Option<&Path>) -> Result<bool>;
+
+    /// Create a new workspace/worktree.
+    fn create_workspace_in(
+        &self,
+        opts: &CreateWorkspaceOptions,
+        workdir: Option<&Path>,
+    ) -> Result<()>;
+
+    /// List all workspaces/worktrees.
+    fn list_workspaces_in(&self, workdir: Option<&Path>) -> Result<Vec<WorkspaceEntry>>;
+
+    /// Move a registered workspace/worktree to a new path.
+    fn move_workspace(&self, old_path: &Path, new_path: &Path) -> Result<()>;
+
+    /// Remove a workspace/worktree, identified by handle (directory name) or branch/bookmark name.
+    fn remove_workspace_at(&self, handle_or_name: &str, common_dir: &Path) -> Result<()>;
+
+    /// Prune stale workspace/worktree metadata.
+    fn prune_workspaces_in(&self, common_dir: &Path) -> Result<()>;
+
+    /// Get the default branch/bookmark (e.g., "main" or "master").
+    fn get_default_branch_in(&self, workdir: Option<&Path>) -> Result<String>;
+
+    /// Check if a branch/bookmark exists.
+    fn branch_exists_in(&self, name: &str, workdir: Option<&Path>) -> Result<bool>;
+
+    /// Check if a *local* branch/bookmark exists, excluding
+    /// remote-tracking spellings. git distinguishes the two; jj bookmarks
+    /// are local by definition, so the default mirrors
+    /// [`Self::branch_exists_in`].
+    fn local_branch_exists_in(&self, name: &str, workdir: Option<&Path>) -> Result<bool> {
+        self.branch_exists_in(name, workdir)
+    }
+
+    /// Get the current branch/bookmark checked out in `workdir`.
+    /// Returns `None` for a detached/anonymous state.
+    fn get_current_branch_in(&self, workdir: &Path) -> Result<Option<String>>;
+
+    /// Delete a branch/bookmark.
+    fn delete_branch_in(&self, name: &str, force: bool, common_dir: &Path) -> Result<()>;
+
+    /// Get the merge base branch/commit for comparisons.
+    fn get_merge_base_in(&self, workdir: Option<&Path>, base: &str) -> Result<String>;
+
+    /// Get status information (ahead/behind, dirty state, diff stats) for a workspace/worktree.
+    fn get_status(&self, workspace_path: &Path, main_branch: Option<&str>) -> Result<VcsStatus>;
+
+    /// Whether removing a workspace keeps its working-copy changes.
+    ///
+    /// jj abandons an empty `@` on `workspace forget` but leaves a non-empty
+    /// one in the repo as a head, so removal never loses work. Git deletes
+    /// the directory and its uncommitted changes with it, so removal flows
+    /// must block on dirtiness for git only.
+    fn preserves_working_copy_on_remove(&self) -> bool {
+        false
+    }
+
+    /// Access the per-workspace metadata store for this backend.
+    fn meta(&self) -> &dyn WorkmuxMetaStore;
+
+    /// Acquire a lock that serializes a whole *sequence* of creation-time
+    /// operations (workspace creation plus the several metadata writes that
+    /// follow it) against other concurrent workmux processes.
+    ///
+    /// This exists for backends whose creation sequence touches a shared
+    /// file that the VCS itself locks non-cooperatively: `git worktree add`
+    /// and every `git config` write both take `.git/config.lock`, so two
+    /// parallel `workmux add` runs fail with "could not lock config file"
+    /// unless the whole sequence is serialized. `GitBackend` overrides this
+    /// to acquire [`crate::git::GitConfigLock`].
+    ///
+    /// The default is a no-op guard, which is correct for backends whose
+    /// metadata store already locks internally per write and whose workspace
+    /// creation shares no such file (jj: `JjMetaStore` takes its own
+    /// `FileLock` around each `set`).
+    ///
+    /// The returned guard releases the lock when dropped; callers should drop
+    /// it as soon as the creation sequence is done.
+    fn lock_creation_sequence(&self, _common_dir: &Path) -> Result<CreationLock> {
+        Ok(Box::new(()))
+    }
+
+    /// Get branches whose upstream remote-tracking branch has been deleted.
+    ///
+    /// No jj analog in v1 — default to empty, overridden by `GitBackend`.
+    fn get_gone_branches_in(&self, _common_dir: &Path) -> Result<Vec<String>> {
+        Ok(vec![])
+    }
+
+    /// Fetch from the remote with prune, updating remote-tracking refs.
+    ///
+    /// No jj analog in v1 — default to no-op, overridden by `GitBackend`.
+    fn fetch_prune_in(&self, _workdir: Option<&Path>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Get the set of local branches/bookmarks that have commits not
+    /// reachable from `base_commit`, used to warn before removing a branch
+    /// with unmerged work.
+    ///
+    /// Returns `Ok(None)` when this backend cannot determine unmerged
+    /// status — the default, and left as-is by `JjBackend` (no jj analog in
+    /// v1). Callers must treat `None` as "protection unavailable" and warn
+    /// the user explicitly rather than silently skipping the check.
+    /// `GitBackend` overrides this to return `Ok(Some(..))`.
+    fn get_unmerged_branches_in(
+        &self,
+        _workdir: Option<&Path>,
+        _base_commit: &str,
+    ) -> Result<Option<HashSet<String>>> {
+        Ok(None)
+    }
+}
+
+/// Opaque RAII guard returned by [`VcsBackend::lock_creation_sequence`].
+///
+/// Dropping it releases whatever lock the backend acquired (nothing, for
+/// backends that need no sequence-level lock).
+pub type CreationLock = Box<dyn Send>;
+
+/// Per-workspace metadata storage, abstracted over the backend's native
+/// mechanism (git config for `GitBackend`).
+pub trait WorkmuxMetaStore: Send + Sync {
+    /// Retrieve a metadata value for `handle`, or `None` if unset.
+    fn get(&self, handle: &str, key: &str, workdir: Option<&Path>) -> Option<String>;
+
+    /// Store a metadata value for `handle`.
+    fn set(&self, handle: &str, key: &str, value: &str, workdir: Option<&Path>) -> Result<()>;
+
+    /// Remove all metadata for `handle`, using an explicitly identified repository.
+    fn remove_all_at(&self, handle: &str, common_dir: &Path) -> Result<()>;
+
+    /// Migrate all metadata from `old_handle` to `new_handle`.
+    fn migrate(&self, old_handle: &str, new_handle: &str, workdir: Option<&Path>) -> Result<()>;
+
+    /// Retrieve the stored base branch/commit for `branch`, or `None` if unset.
+    fn get_branch_base(&self, branch: &str, workdir: Option<&Path>) -> Option<String>;
+
+    /// Store the base branch/commit that `branch` was created from.
+    fn set_branch_base(&self, branch: &str, base: &str, workdir: Option<&Path>) -> Result<()>;
+
+    /// Batch-read one metadata key across every workspace:
+    /// `handle -> value`. Backends with a batched native read should
+    /// override this (git: one `git config --get-regexp`; jj: one TOML
+    /// parse); the default loops over nothing and simply returns an empty
+    /// map, so callers must not rely on it enumerating values.
+    fn get_all_key(
+        &self,
+        _workdir: Option<&Path>,
+        _key: &str,
+    ) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
+    }
+}
