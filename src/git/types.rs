@@ -53,4 +53,9 @@ pub struct GitStatus {
     /// Whether a rebase is currently in progress
     #[serde(default)]
     pub is_rebasing: bool,
+    /// Commit id at HEAD / `@`. Git leaves this unset; jj fills it so
+    /// callers can point at where working-copy changes went after a
+    /// workspace removal.
+    #[serde(default)]
+    pub head_commit: Option<String>,
 }

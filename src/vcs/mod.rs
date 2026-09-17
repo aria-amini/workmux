@@ -7,7 +7,9 @@
 //! Both `GitBackend` and `JjBackend` exist; nothing in the rest of the
 //! codebase is wired to use this module yet.
 
+pub mod detect;
 pub mod git_backend;
+pub mod jj_backend;
 pub mod jj_meta;
 pub mod jj_security;
 pub mod meta_lock;
@@ -19,6 +21,8 @@ use std::path::{Path, PathBuf};
 
 #[allow(unused_imports)]
 pub use git_backend::{GitBackend, GitConfigMetaStore};
+#[allow(unused_imports)]
+pub use jj_backend::JjBackend;
 #[allow(unused_imports)]
 pub use jj_meta::JjMetaStore;
 pub use types::{CreateWorkspaceOptions, RepoKind, WorkspaceEntry};

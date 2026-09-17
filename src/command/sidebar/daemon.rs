@@ -461,6 +461,7 @@ fn git_status_semantically_equal(a: &GitStatus, b: &GitStatus) -> bool {
         branch: _,
         has_upstream: _,
         is_rebasing: _,
+        head_commit: _,
     } = a;
 
     a.ahead == b.ahead

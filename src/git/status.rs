@@ -436,6 +436,7 @@ pub fn get_git_status(worktree_path: &Path, main_branch: Option<&str>) -> GitSta
         branch: Some(branch),
         has_upstream,
         is_rebasing,
+        head_commit: None,
     }
 }
 
